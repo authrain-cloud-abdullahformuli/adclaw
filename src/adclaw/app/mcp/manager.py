@@ -1,0 +1,431 @@
+# -*- coding: utf-8 -*-
+"""MCP client manager for hot-reloadable client lifecycle management.
+
+This module provides centralized management of MCP clients with support
+for runtime updates without restarting the application.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import inspect
+import logging
+import sys
+from typing import Any, Dict, Iterable, List, TYPE_CHECKING
+
+from agentscope.mcp import HttpStatefulClient, StdIOStatefulClient
+
+# BaseExceptionGroup is a builtin in 3.11+; on 3.10 we use the
+# `exceptiongroup` backport (declared in pyproject.toml only for 3.10).
+if sys.version_info < (3, 11):
+    from exceptiongroup import BaseExceptionGroup  # noqa: F401
+
+if TYPE_CHECKING:
+    from ...config.config import MCPClientConfig, MCPConfig
+
+logger = logging.getLogger(__name__)
+
+
+class MCPClientManager:
+    """Manages MCP clients with hot-reload support.
+
+    This manager handles the lifecycle of MCP clients, including:
+    - Initial loading from config
+    - Runtime replacement when config changes
+    - Cleanup on shutdown
+
+    Design pattern mirrors ChannelManager for consistency.
+    """
+
+    def __init__(self) -> None:
+        """Initialize an empty MCP client manager."""
+        self._clients: Dict[str, Any] = {}
+        self._client_revisions: Dict[str, int] = {}
+        self._lock = asyncio.Lock()
+
+    @staticmethod
+    async def _close_client_quietly(
+        client: Any,
+        *,
+        key: str,
+        reason: str,
+    ) -> None:
+        """Close a client without letting shutdown noise escape.
+
+        anyio-backed MCP transports may raise ``asyncio.CancelledError`` or
+        ``BaseExceptionGroup`` during teardown when the app itself is already
+        stopping. That should not fail FastAPI shutdown or emit a scary
+        traceback for an otherwise clean stop.
+        """
+        try:
+            close_method = getattr(client, "close")
+            try:
+                supports_ignore_errors = (
+                    "ignore_errors"
+                    in inspect.signature(close_method).parameters
+                )
+            except (TypeError, ValueError):
+                supports_ignore_errors = False
+
+            if supports_ignore_errors:
+                await close_method(ignore_errors=False)
+            else:
+                await close_method()
+        except asyncio.CancelledError as exc:
+            current_task = asyncio.current_task()
+            if current_task is not None and current_task.cancelling():
+                raise
+
+            logger.debug(
+                "MCP client '%s' close cancelled during %s: %s",
+                key,
+                reason,
+                exc,
+            )
+        except BaseExceptionGroup as exc:
+            log_method = (
+                logger.debug
+                if MCPClientManager._is_benign_close_group(exc)
+                else logger.warning
+            )
+            log_method(
+                "MCP client '%s' close raised BaseExceptionGroup during %s: %s",
+                key,
+                reason,
+                exc,
+            )
+        except Exception as exc:
+            if MCPClientManager._is_benign_close_error(exc):
+                logger.debug(
+                    "MCP client '%s' close reported benign shutdown noise during %s: %s",
+                    key,
+                    reason,
+                    exc,
+                )
+            else:
+                logger.warning(
+                    "Error closing MCP client '%s' during %s: %s",
+                    key,
+                    reason,
+                    exc,
+                )
+
+    @staticmethod
+    def _is_benign_close_error(exc: BaseException) -> bool:
+        if isinstance(exc, asyncio.CancelledError):
+            return True
+
+        message = str(exc)
+        return (
+            "cancel scope" in message
+            and "current tasks's current cancel scope" in message
+        )
+
+    @classmethod
+    def _is_benign_close_group(cls, exc: BaseExceptionGroup) -> bool:
+        return all(
+            cls._is_benign_close_group(child)
+            if isinstance(child, BaseExceptionGroup)
+            else isinstance(child, (Exception, asyncio.CancelledError))
+            and cls._is_benign_close_error(child)
+            for child in exc.exceptions
+        )
+
+    async def init_from_config(self, config: "MCPConfig") -> None:
+        """Initialize clients from configuration.
+
+        Args:
+            config: MCP configuration containing client definitions
+        """
+        logger.debug("Initializing MCP clients from config")
+        for key, client_config in config.clients.items():
+            if not client_config.enabled:
+                logger.debug(f"MCP client '{key}' is disabled, skipping")
+                continue
+
+            try:
+                await self._add_client(key, client_config)
+                logger.debug(f"MCP client '{key}' initialized successfully")
+            except (Exception, BaseExceptionGroup) as e:
+                # anyio TaskGroup teardown raises BaseExceptionGroup which
+                # is NOT a subclass of Exception in Python 3.11+; without
+                # it here a broken client (e.g. HTTP 401) crashes the whole
+                # FastAPI lifespan with "Application startup failed".
+                logger.warning(
+                    f"Failed to initialize MCP client '{key}': {e}",
+                    exc_info=True,
+                )
+
+    async def get_clients(self, keys: Iterable[str] | None = None) -> List[Any]:
+        """Get list of all active MCP clients.
+
+        This method is called by the runner on each query to get
+        the latest set of clients.
+
+        Args:
+            keys: Optional config keys to include. ``None`` returns all
+                connected clients.
+
+        Returns:
+            List of connected MCP client instances
+        """
+        async with self._lock:
+            if keys is not None:
+                allowed = set(keys)
+                return [
+                    client
+                    for key, client in self._clients.items()
+                    if key in allowed and client is not None
+                ]
+            return [
+                client
+                for client in self._clients.values()
+                if client is not None
+            ]
+
+    async def replace_client(
+        self,
+        key: str,
+        client_config: "MCPClientConfig",
+        timeout: float = 60.0,
+    ) -> None:
+        """Replace or add a client with new configuration.
+
+        Flow: connect new (outside lock) → swap + close old (inside lock).
+        This ensures minimal lock holding time.
+
+        Args:
+            key: Client identifier (from config)
+            client_config: New client configuration
+            timeout: Connection timeout in seconds (default 60s)
+        """
+        async with self._lock:
+            operation_revision = self._bump_client_revision_locked(key)
+
+        # 1. Create and connect new client outside lock (may be slow)
+        logger.debug(f"Connecting new MCP client: {key}")
+        new_client = self._build_client(client_config)
+
+        try:
+            # Add timeout to prevent indefinite blocking
+            await asyncio.wait_for(new_client.connect(), timeout=timeout)
+        except asyncio.TimeoutError:
+            logger.warning(
+                f"Timeout connecting MCP client '{key}' after {timeout}s",
+            )
+            await self._close_client_quietly(
+                new_client,
+                key=key,
+                reason="timeout cleanup",
+            )
+            raise
+        except asyncio.CancelledError:
+            await self._close_client_quietly(
+                new_client,
+                key=key,
+                reason="cancelled replacement cleanup",
+            )
+            raise
+        except (Exception, BaseExceptionGroup) as e:
+            logger.warning(
+                f"Failed to connect MCP client '{key}': {e}",
+                exc_info=True,
+            )
+            await self._close_client_quietly(
+                new_client,
+                key=key,
+                reason="connect failure cleanup",
+            )
+            raise
+
+        # 2. Swap inside lock, then close old client outside lock
+        stale_client = None
+        async with self._lock:
+            if self._client_revisions.get(key, 0) != operation_revision:
+                stale_client = new_client
+                old_client = None
+            else:
+                old_client = self._clients.get(key)
+                self._clients[key] = new_client
+
+        if stale_client is not None:
+            logger.debug(
+                "MCP client '%s' replacement became stale, closing",
+                key,
+            )
+            await self._close_client_quietly(
+                stale_client,
+                key=key,
+                reason="stale replacement cleanup",
+            )
+            return
+
+        if old_client is not None:
+            logger.debug(f"Closing old MCP client: {key}")
+            await self._close_client_quietly(
+                old_client,
+                key=key,
+                reason="client replacement",
+            )
+        else:
+            logger.debug(f"Added new MCP client: {key}")
+
+    async def remove_client(self, key: str) -> None:
+        """Remove and close a client.
+
+        Args:
+            key: Client identifier to remove
+        """
+        async with self._lock:
+            old_client = self._clients.pop(key, None)
+            self._bump_client_revision_locked(key)
+
+        if old_client is not None:
+            logger.debug(f"Removing MCP client: {key}")
+            await self._close_client_quietly(
+                old_client,
+                key=key,
+                reason="client removal",
+            )
+
+    async def close_all(self) -> None:
+        """Close all MCP clients.
+
+        Called during application shutdown.
+        """
+        async with self._lock:
+            clients_snapshot = list(self._clients.items())
+            self._clients.clear()
+            for key, _client in clients_snapshot:
+                self._bump_client_revision_locked(key)
+
+        logger.debug("Closing all MCP clients")
+        for key, client in clients_snapshot:
+            if client is not None:
+                await self._close_client_quietly(
+                    client,
+                    key=key,
+                    reason="manager shutdown",
+                )
+
+    async def _add_client(
+        self,
+        key: str,
+        client_config: "MCPClientConfig",
+        timeout: float = 60.0,
+    ) -> None:
+        """Add a new client (used during initial setup).
+
+        The caller is responsible for catching BaseExceptionGroup —
+        anyio TaskGroup teardown propagates it through ``client.connect()``
+        and it is not a subclass of Exception in Python 3.11+.
+
+        On connect failure the partially-built client is best-effort
+        closed before the exception propagates, mirroring
+        ``replace_client``.
+
+        Args:
+            key: Client identifier
+            client_config: Client configuration
+            timeout: Connection timeout in seconds (default 60s)
+        """
+        async with self._lock:
+            expected_revision = self._client_revisions.get(key, 0)
+            if self._clients.get(key) is not None:
+                logger.debug(
+                    "Initial MCP client '%s' already exists, skipping",
+                    key,
+                )
+                return
+
+        client = self._build_client(client_config)
+
+        try:
+            # Add timeout to prevent indefinite blocking
+            await asyncio.wait_for(client.connect(), timeout=timeout)
+        except asyncio.CancelledError:
+            await self._close_client_quietly(
+                client,
+                key=key,
+                reason="cancelled initial add cleanup",
+            )
+            raise
+        except (Exception, BaseExceptionGroup):
+            await self._close_client_quietly(
+                client,
+                key=key,
+                reason="initial add cleanup",
+            )
+            raise
+
+        should_close = False
+        installed = False
+        try:
+            async with self._lock:
+                current_revision = self._client_revisions.get(key, 0)
+                if (
+                    self._clients.get(key) is not None
+                    or current_revision != expected_revision
+                ):
+                    should_close = True
+                else:
+                    self._clients[key] = client
+                    installed = True
+
+            if should_close:
+                logger.debug(
+                    "Initial MCP client '%s' became stale, closing",
+                    key,
+                )
+                await self._close_client_quietly(
+                    client,
+                    key=key,
+                    reason="stale initial add cleanup",
+                )
+        except asyncio.CancelledError:
+            if not installed:
+                await self._close_client_quietly(
+                    client,
+                    key=key,
+                    reason="cancelled initial add post-connect cleanup",
+                )
+            raise
+
+    def _bump_client_revision_locked(self, key: str) -> int:
+        """Record that a client key changed while holding ``_lock``."""
+        self._client_revisions[key] = self._client_revisions.get(key, 0) + 1
+        return self._client_revisions[key]
+
+    @staticmethod
+    def _build_client(client_config: "MCPClientConfig") -> Any:
+        """Build MCP client instance by configured transport."""
+        rebuild_info = {
+            "name": client_config.name,
+            "transport": client_config.transport,
+            "url": client_config.url,
+            "headers": client_config.headers or None,
+            "command": client_config.command,
+            "args": list(client_config.args),
+            "env": dict(client_config.env),
+            "cwd": client_config.cwd or None,
+        }
+
+        if client_config.transport == "stdio":
+            client = StdIOStatefulClient(
+                name=client_config.name,
+                command=client_config.command,
+                args=client_config.args,
+                env=client_config.env,
+                cwd=client_config.cwd or None,
+            )
+            setattr(client, "_adclaw_rebuild_info", rebuild_info)
+            return client
+
+        client = HttpStatefulClient(
+            name=client_config.name,
+            transport=client_config.transport,
+            url=client_config.url,
+            headers=client_config.headers or None,
+        )
+        setattr(client, "_adclaw_rebuild_info", rebuild_info)
+        return client

@@ -1,0 +1,100 @@
+# Build optional AdClaw Docker images (browser/full) and push to Docker Hub on release.
+#
+# Tags pushed per release:
+#   - <version>-full, <version>-browser  (e.g. 1.0.0-full)
+#   - full, browser                      (moving tags)
+#   - latest                             (points to full, for DO Marketplace compat)
+#
+# For DO Marketplace backwards compatibility, `latest` tracks the `full` variant.
+#
+# Hosted Cloudflare promotion does not wait for this workflow. The core image is
+# published by `Docker Core Build and Push` so paid Host sandboxes can be
+# promoted as soon as the lightweight image is available.
+name: Docker Browser/Full Build and Push
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Image tag (e.g. v1.0.0)"
+        required: true
+        type: string
+
+env:
+  IMAGE: nttylock/adclaw
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # Dockerfile picks extras based on ADCLAW_VARIANT:
+        #   browser → [browser,local]
+        #   full    → [all,local]
+        variant: [full, browser]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v4
+        with:
+          registry: docker.io
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_PASSWORD }}
+
+      - name: Determine version tag
+        id: version
+        run: |
+          if [ -n "${{ inputs.version }}" ]; then
+            echo "tag=${{ inputs.version }}" >> "$GITHUB_OUTPUT"
+          elif [ -n "${{ github.event.release.tag_name }}" ]; then
+            echo "tag=${{ github.event.release.tag_name }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Compute variant tags
+        id: tags
+        run: |
+          VER="${{ steps.version.outputs.tag }}"
+          VARIANT="${{ matrix.variant }}"
+          # Strip leading 'v' from tag (e.g. v1.0.0 → 1.0.0)
+          VER_CLEAN="${VER#v}"
+          TAGS="docker.io/${{ env.IMAGE }}:${VER_CLEAN}-${VARIANT}"
+          TAGS="${TAGS},docker.io/${{ env.IMAGE }}:${VARIANT}"
+          # `latest` tracks `full` variant for DO Marketplace backwards compat
+          if [ "$VARIANT" = "full" ]; then
+            TAGS="${TAGS},docker.io/${{ env.IMAGE }}:${VER_CLEAN}"
+            TAGS="${TAGS},docker.io/${{ env.IMAGE }}:latest"
+          fi
+          echo "tags=${TAGS}" >> "$GITHUB_OUTPUT"
+          echo "Tags: ${TAGS}"
+
+      - name: Build and push ${{ matrix.variant }}
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: deploy/Dockerfile
+          push: true
+          platforms: linux/amd64,linux/arm64
+          tags: ${{ steps.tags.outputs.tags }}
+          build-args: |
+            ADCLAW_VARIANT=${{ matrix.variant }}
+            ADCLAW_ENABLED_CHANNELS=discord,dingtalk,feishu,qq,console,telegram
+          cache-from: type=gha,scope=${{ matrix.variant }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.variant }}

@@ -1,0 +1,185 @@
+/* Welcome avatar: fit wide logo. */
+:global([class*="chat-anywhere-welcome-default"] [class*="-avatar"]) {
+  width: 48px !important;
+  height: 48px !important;
+  min-width: 48px !important;
+  min-height: 48px !important;
+  font-size: 18px !important;
+  flex-shrink: 0;
+  overflow: visible !important;
+}
+
+:global([class*="chat-anywhere-welcome-default"] [class*="-avatar"] > img) {
+  object-fit: contain !important;
+  object-position: center;
+  width: 100% !important;
+  height: 100% !important;
+}
+
+.chatStage {
+  position: relative;
+  flex: 1;
+  min-height: 0;
+}
+
+.liveProgress {
+  width: 100%;
+  margin: 6px 0 8px;
+  pointer-events: none;
+}
+
+.liveProgressInner {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 0 6px;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  color: var(--citedy-slate-700, #334155);
+  box-shadow: none;
+  backdrop-filter: none;
+  -webkit-backdrop-filter: none;
+}
+
+.liveProgressPulse {
+  width: 7px;
+  height: 7px;
+  border-radius: 999px;
+  background: #16a34a;
+  box-shadow: 0 0 0 0 rgba(22, 163, 74, 0.42);
+  animation: live-progress-pulse 1.5s ease-out infinite;
+  flex: 0 0 auto;
+}
+
+.liveProgressError {
+  width: 7px;
+  height: 7px;
+  border-radius: 999px;
+  background: #f97316;
+  box-shadow: 0 0 0 4px rgba(249, 115, 22, 0.16);
+  flex: 0 0 auto;
+}
+
+.liveProgressText {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  min-width: 0;
+  flex: 1 1 auto;
+}
+
+.liveProgressTitle {
+  font-size: 13px;
+  font-weight: 700;
+  line-height: 1.3;
+  color: var(--citedy-slate-900, #0f172a);
+}
+
+.liveProgressDetail {
+  font-size: 12px;
+  line-height: 1.35;
+  color: var(--citedy-slate-500, #64748b);
+}
+
+.liveProgressElapsed {
+  margin-left: auto;
+  padding: 3px 8px;
+  border-radius: 999px;
+  background: rgba(15, 23, 42, 0.06);
+  color: var(--citedy-slate-500, #64748b);
+  font-size: 11px;
+  font-weight: 700;
+  line-height: 1;
+  font-variant-numeric: tabular-nums;
+  flex: 0 0 auto;
+}
+
+@keyframes live-progress-pulse {
+  0% {
+    box-shadow: 0 0 0 0 rgba(22, 163, 74, 0.42);
+    transform: scale(0.94);
+  }
+
+  70% {
+    box-shadow: 0 0 0 8px rgba(22, 163, 74, 0);
+    transform: scale(1);
+  }
+
+  100% {
+    box-shadow: 0 0 0 0 rgba(22, 163, 74, 0);
+    transform: scale(0.94);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .liveProgressPulse {
+    animation: none;
+    transform: none;
+  }
+}
+
+@media (prefers-color-scheme: dark) {
+  .liveProgressInner {
+    background: transparent;
+    color: var(--citedy-slate-300, #cbd5e1);
+    box-shadow: none;
+  }
+
+  .liveProgressTitle {
+    color: var(--citedy-slate-50, #f8fafc);
+  }
+
+  .liveProgressDetail {
+    color: var(--citedy-slate-300, #cbd5e1);
+  }
+
+  .liveProgressElapsed {
+    background: rgba(248, 250, 252, 0.1);
+    color: var(--citedy-slate-300, #cbd5e1);
+  }
+}
+
+@media (max-width: 640px) {
+  .liveProgress {
+    margin-bottom: 8px;
+  }
+
+  .liveProgressInner {
+    align-items: center;
+  }
+
+  .liveProgressText {
+    align-items: flex-start;
+    flex-direction: column;
+    gap: 1px;
+  }
+
+  .liveProgressElapsed {
+    margin-top: 2px;
+  }
+}
+
+/* Disabled input overlay */
+.chatDisabledOverlay {
+  position: relative;
+  height: 100%;
+  width: 100%;
+}
+
+.chatDisabledOverlay :global([class*="chat-anywhere-input"]),
+.chatDisabledOverlay :global([class*="chat-input"]),
+.chatDisabledOverlay :global(textarea),
+.chatDisabledOverlay :global(input[type="text"]) {
+  pointer-events: none !important;
+  opacity: 0.5 !important;
+  background-color: var(--citedy-slate-50) !important;
+  cursor: not-allowed !important;
+}
+
+.chatDisabledOverlay :global(button[class*="send"]),
+.chatDisabledOverlay :global(button[class*="submit"]) {
+  pointer-events: none !important;
+  opacity: 0.3 !important;
+  cursor: not-allowed !important;
+}

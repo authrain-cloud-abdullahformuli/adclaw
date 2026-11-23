@@ -1,0 +1,97 @@
+import logging
+from ...config.config import PersonaConfig
+from ..persona_manager import PersonaManager
+
+logger = logging.getLogger(__name__)
+
+DELEGATION_FAILED_PREFIX = "Delegation failed:"
+
+
+def _text_from_content(content) -> str:
+    if content is None:
+        return ""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = []
+        for block in content:
+            if isinstance(block, dict) and block.get("type") == "text":
+                parts.append(block.get("text", ""))
+            elif getattr(block, "type", None) == "text":
+                parts.append(getattr(block, "text", ""))
+        return "".join(parts)
+    return str(content)
+
+
+async def _collect_model_text(response) -> str:
+    if hasattr(response, "__aiter__"):
+        last_text = ""
+        async for chunk in response:
+            text = _text_from_content(getattr(chunk, "content", ""))
+            if text:
+                last_text = text
+        return last_text
+    return _text_from_content(getattr(response, "content", response))
+
+
+async def execute_delegation(
+    persona: PersonaConfig,
+    task: str,
+    persona_manager: PersonaManager,
+) -> str:
+    """Execute a delegated task by creating a sub-agent with persona config.
+
+    For MVP, uses a simple one-shot LLM call with the persona's system prompt.
+    """
+    try:
+        from ..prompt import PromptBuilder
+        from pathlib import Path
+        from ...constant import WORKING_DIR
+
+        builder = PromptBuilder(
+            working_dir=Path(WORKING_DIR),
+            persona=persona,
+            team_summary=persona_manager.get_team_summary(),
+        )
+        sys_prompt = builder.build()
+
+        from ..model_factory import create_model_and_formatter
+        if persona.model_provider and persona.model_name:
+            from ...providers.models import ModelSlotConfig
+            from ...providers.store import _resolve_slot, load_providers_json
+
+            llm_cfg = _resolve_slot(
+                ModelSlotConfig(
+                    provider_id=persona.model_provider,
+                    model=persona.model_name,
+                ),
+                load_providers_json(),
+            )
+            if llm_cfg is None:
+                logger.warning(
+                    "Could not resolve model %s/%s for persona %s; using default",
+                    persona.model_provider,
+                    persona.model_name,
+                    persona.id,
+                )
+                chat_model, formatter = create_model_and_formatter()
+            else:
+                chat_model, formatter = create_model_and_formatter(
+                    llm_cfg=llm_cfg,
+                )
+        else:
+            chat_model, formatter = create_model_and_formatter()
+
+        from agentscope.message import Msg
+        user_msg = Msg(
+            name="user",
+            content=f"[DELEGATED TASK]\n{task}\n[/DELEGATED TASK]",
+            role="user",
+        )
+        sys_msg = Msg(name="system", content=sys_prompt, role="system")
+
+        response = await chat_model([sys_msg, user_msg])
+        return await _collect_model_text(response)
+    except Exception as e:
+        logger.exception("Delegation execution failed for persona %s", persona.id)
+        return f"{DELEGATION_FAILED_PREFIX} Check server logs for details."

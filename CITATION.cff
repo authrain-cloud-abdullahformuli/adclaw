@@ -1,0 +1,12 @@
+cff-version: 1.2.0
+message: "If you use AdClaw, please cite it as below."
+authors:
+  - family-names: Formuli
+    given-names: Abdullah
+    email: authrainmedia@gmail.com
+title: "AdClaw: Autonomous Multi-Agent AI Marketing Team"
+version: 2.0.0
+date-released: 2026-11-22
+url: "https://github.com/authrain-cloud-abdullahformuli/adclaw"
+repository-code: "https://github.com/authrain-cloud-abdullahformuli/adclaw"
+license: MIT

@@ -1,0 +1,1284 @@
+# -*- coding: utf-8 -*-
+"""Reading and writing provider configuration (providers.json)."""
+
+from __future__ import annotations
+
+import json
+import logging
+import os
+from pathlib import Path
+from typing import Any, Callable, Optional
+from urllib.parse import urlsplit, urlunsplit
+from urllib.error import HTTPError
+from urllib.request import HTTPRedirectHandler, Request, build_opener
+
+from ..constant import MODEL_PROVIDER_CHECK_TIMEOUT, SECRET_DIR, WORKING_DIR
+from .models import (
+    CustomProviderData,
+    FallbackConfig,
+    FallbackSlot,
+    ModelInfo,
+    ModelSlotConfig,
+    ProviderSettings,
+    ProvidersData,
+    ResolvedModelConfig,
+)
+from .registry import (
+    PROVIDERS,
+    get_chat_model_class,
+    get_provider_chat_model,
+    is_builtin,
+    register_custom_provider,
+    sync_custom_providers,
+    sync_local_models,
+    sync_ollama_models,
+    unregister_custom_provider,
+    validate_custom_provider_id,
+)
+
+logger = logging.getLogger(__name__)
+
+_PROVIDERS_JSON = SECRET_DIR / "providers.json"
+_HOST_AI_PROVIDER_ID = "adclaw-host-ai"
+_HOST_AI_TOKEN_PREFIX = "ach_"
+_HOST_AI_ALLOWED_HOSTS_ENV = "ADCLAW_HOST_AI_DIRECT_ALLOWED_HOSTS"
+_HOST_AI_DEFAULT_ALLOWED_HOSTS = ("real.adclaw.app",)
+_LEGACY_PROVIDERS_JSON_CANDIDATES = (
+    Path(__file__).resolve().parent / "providers.json",
+    WORKING_DIR / "providers.json",
+    WORKING_DIR / ".secret" / "providers.json",
+)
+
+
+class ProviderUsageRequestError(Exception):
+    """Upstream provider usage endpoint could not be reached successfully."""
+
+
+class _NoRedirectHandler(HTTPRedirectHandler):
+    def redirect_request(self, *_args, **_kwargs):  # type: ignore[override]
+        return None
+
+
+def _urlopen_no_redirect(request: Request, *, timeout: float):
+    return build_opener(_NoRedirectHandler).open(request, timeout=timeout)
+
+
+def _same_path(a: Path, b: Path) -> bool:
+    try:
+        return a.resolve() == b.resolve()
+    except OSError:
+        return False
+
+
+def _chmod_best_effort(path: Path, mode: int) -> None:
+    try:
+        os.chmod(path, mode)
+    except OSError:
+        # Some systems/filesystems may not support chmod semantics.
+        pass
+
+
+def _host_matches_allowed_pattern(hostname: str, pattern: str) -> bool:
+    host = hostname.strip().lower()
+    allowed = pattern.strip().lower()
+    if not host or not allowed:
+        return False
+    if allowed.startswith("*."):
+        suffix = allowed[1:]
+        return host.endswith(suffix) and host != allowed[2:]
+    return host == allowed
+
+
+def _host_ai_allowed_hosts() -> tuple[str, ...]:
+    raw = os.environ.get(_HOST_AI_ALLOWED_HOSTS_ENV, "")
+    values = tuple(part.strip() for part in raw.split(",") if part.strip())
+    return values or _HOST_AI_DEFAULT_ALLOWED_HOSTS
+
+
+def _host_ai_base_url_allowed(base_url: str) -> bool:
+    try:
+        parsed = urlsplit(base_url)
+    except ValueError:
+        return False
+    if parsed.scheme != "https":
+        return False
+    if parsed.username or parsed.password or parsed.query or parsed.fragment:
+        return False
+    if parsed.path.rstrip("/") != "/api/host-ai/v1":
+        return False
+    hostname = parsed.hostname or ""
+    return any(
+        _host_matches_allowed_pattern(hostname, allowed)
+        for allowed in _host_ai_allowed_hosts()
+    )
+
+
+def _prepare_secret_parent(path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    _chmod_best_effort(path.parent, 0o700)
+
+
+def _migrate_legacy_providers_json(path: Path) -> None:
+    """Copy or merge old providers.json into secret dir once (best effort)."""
+    if path.exists() and not path.is_file():
+        logger.error(
+            "providers.json path exists but is not a regular file: %s",
+            path,
+        )
+        return
+
+    marker = path.with_name(".providers-legacy-migrated")
+    if path.is_file() and marker.exists():
+        return
+
+    evaluated_legacy = False
+    for legacy in _LEGACY_PROVIDERS_JSON_CANDIDATES:
+        if not legacy.is_file() or _same_path(legacy, path):
+            continue
+        try:
+            _prepare_secret_parent(path)
+            if path.is_file():
+                _merge_legacy_provider_state(path, legacy)
+            else:
+                data = _load_providers_data_from_path(legacy)
+                save_providers_json(data, path)
+            evaluated_legacy = True
+        except Exception as exc:
+            logger.warning(
+                "Failed to migrate legacy providers.json from %s: %s",
+                legacy,
+                exc,
+            )
+            continue
+
+    if evaluated_legacy:
+        marker.touch(exist_ok=True)
+        _chmod_best_effort(marker, 0o600)
+
+
+def get_providers_json_path() -> Path:
+    """Return providers.json path under SECRET_DIR."""
+    return _PROVIDERS_JSON
+
+
+def _ensure_base_url(settings: ProviderSettings, defn) -> None:
+    if not settings.base_url and defn.default_base_url:
+        settings.base_url = defn.default_base_url
+
+
+def _normalize_ollama_base_url(base_url: str) -> str:
+    """Normalize Ollama OpenAI-compatible endpoint to include /v1.
+
+    Older configs may use http://localhost:11434 (missing /v1), which leads
+    to OpenAI client requests returning 404.
+    """
+    value = (base_url or "").strip()
+    if not value:
+        return value
+
+    try:
+        parts = urlsplit(value)
+    except ValueError:
+        return value
+
+    path = parts.path or ""
+    if path in ("", "/"):
+        path = "/v1"
+    elif path == "/v1/":
+        path = "/v1"
+
+    return urlunsplit(
+        (parts.scheme, parts.netloc, path, parts.query, parts.fragment),
+    )
+
+
+def _normalize_special_provider_settings(
+    provider_id: str,
+    settings: ProviderSettings,
+) -> None:
+    """Apply provider-specific settings normalization."""
+    if provider_id == "ollama" and settings.base_url:
+        settings.base_url = _normalize_ollama_base_url(settings.base_url)
+
+
+def _migrate_legacy_custom(
+    providers: dict[str, ProviderSettings],
+    custom_providers: dict[str, CustomProviderData],
+) -> None:
+    """Move ``providers["custom"]`` into ``custom_providers``."""
+    old = providers.pop("custom", None)
+    if old is None:
+        return
+
+    if "custom" in custom_providers:
+        cpd = custom_providers["custom"]
+        if old.api_key and not cpd.api_key:
+            cpd.api_key = old.api_key
+        if old.base_url and not cpd.base_url:
+            cpd.base_url = old.base_url
+        return
+
+    if not old.base_url and not old.api_key:
+        return
+
+    custom_providers["custom"] = CustomProviderData(
+        id="custom",
+        name="Custom",
+        default_base_url=old.base_url,
+        api_key_prefix="",
+        models=[],
+        base_url=old.base_url,
+        api_key=old.api_key,
+    )
+
+
+def _parse_new_format(raw: dict):
+    """Returns ``(providers, custom_providers, active_llm, fallback)``."""
+    providers: dict[str, ProviderSettings] = {}
+    for key, value in raw.get("providers", {}).items():
+        if isinstance(value, dict):
+            providers[key] = ProviderSettings.model_validate(value)
+
+    custom_providers: dict[str, CustomProviderData] = {}
+    for key, value in raw.get("custom_providers", {}).items():
+        if isinstance(value, dict):
+            custom_providers[key] = CustomProviderData.model_validate(value)
+
+    _migrate_legacy_custom(providers, custom_providers)
+
+    llm_raw = raw.get("active_llm")
+    active_llm = (
+        ModelSlotConfig.model_validate(llm_raw)
+        if isinstance(llm_raw, dict)
+        else ModelSlotConfig()
+    )
+
+    fallback_raw = raw.get("fallback")
+    fallback = (
+        FallbackConfig.model_validate(fallback_raw)
+        if isinstance(fallback_raw, dict)
+        else FallbackConfig()
+    )
+    return providers, custom_providers, active_llm, fallback
+
+
+def _parse_legacy_format(raw: dict):
+    """Returns ``(providers, custom_providers, active_llm, fallback)``."""
+    providers: dict[str, ProviderSettings] = {}
+    custom_providers: dict[str, CustomProviderData] = {}
+    old_active = raw.get("active_provider", "")
+    old_model = ""
+    for key, value in raw.items():
+        if key in ("active_provider", "active_llm"):
+            continue
+        if not isinstance(value, dict):
+            continue
+        model_val = value.pop("model", "")
+        providers[key] = ProviderSettings.model_validate(value)
+        if key == old_active and model_val:
+            old_model = model_val
+    _migrate_legacy_custom(providers, custom_providers)
+    active_llm = (
+        ModelSlotConfig(provider_id=old_active, model=old_model)
+        if old_active
+        else ModelSlotConfig()
+    )
+    return providers, custom_providers, active_llm, FallbackConfig()
+
+
+def _load_providers_data_from_path(path: Path) -> ProvidersData:
+    """Load provider state from a specific legacy or canonical path."""
+    with open(path, "r", encoding="utf-8") as fh:
+        raw: dict = json.load(fh)
+    if "providers" in raw and isinstance(raw["providers"], dict):
+        providers, custom_providers, active_llm, fallback = _parse_new_format(raw)
+    else:
+        providers, custom_providers, active_llm, fallback = _parse_legacy_format(raw)
+    return ProvidersData(
+        providers=providers,
+        custom_providers=custom_providers,
+        active_llm=active_llm,
+        fallback=fallback,
+    )
+
+
+def _merge_legacy_provider_state(path: Path, legacy: Path) -> None:
+    """Merge old secret state into the new secret file without overwriting."""
+    current = _load_providers_data_from_path(path)
+    old = _load_providers_data_from_path(legacy)
+    changed = False
+
+    for pid, old_settings in old.providers.items():
+        settings = current.providers.setdefault(pid, ProviderSettings())
+        if old_settings.api_key and not settings.api_key:
+            settings.api_key = old_settings.api_key
+            changed = True
+        if old_settings.base_url and not settings.base_url:
+            settings.base_url = old_settings.base_url
+            changed = True
+        if old_settings.extra_models and not settings.extra_models:
+            settings.extra_models = old_settings.extra_models
+            changed = True
+        if old_settings.chat_model and not settings.chat_model:
+            settings.chat_model = old_settings.chat_model
+            changed = True
+
+    for pid, old_custom in old.custom_providers.items():
+        custom = current.custom_providers.get(pid)
+        if custom is None:
+            current.custom_providers[pid] = old_custom
+            changed = True
+            continue
+        if old_custom.api_key and not custom.api_key:
+            custom.api_key = old_custom.api_key
+            changed = True
+        if old_custom.base_url and not custom.base_url:
+            custom.base_url = old_custom.base_url
+            changed = True
+        if old_custom.models and not custom.models:
+            custom.models = old_custom.models
+            changed = True
+
+    if (
+        not current.active_llm.provider_id
+        and not current.active_llm.model
+        and old.active_llm.provider_id
+        and old.active_llm.model
+    ):
+        current.active_llm = old.active_llm
+        changed = True
+
+    if (
+        (not current.fallback.enabled or not current.fallback.chain)
+        and old.fallback.enabled
+        and old.fallback.chain
+    ):
+        current.fallback = old.fallback
+        changed = True
+
+    if changed:
+        save_providers_json(current, path)
+
+
+def _validate_active_llm(data: ProvidersData) -> None:
+    """Clear active_llm if its provider is not configured or stale.
+
+    For the special built-in provider ``ollama``, we additionally verify that
+    the configured model still exists in the running Ollama daemon and clear
+    the slot if it does not.
+    """
+    pid = data.active_llm.provider_id
+    if not pid:
+        return
+    defn = PROVIDERS.get(pid)
+    if defn is None or not data.is_configured(defn):
+        data.active_llm = ModelSlotConfig()
+        return
+
+    # Extra validation for Ollama: ensure the active model still exists.
+    if defn.id == "ollama" and data.active_llm.model:
+        try:
+            from ..providers.ollama_manager import OllamaModelManager
+
+            names = {m.name for m in OllamaModelManager.list_models()}
+            if data.active_llm.model not in names:
+                data.active_llm = ModelSlotConfig()
+        except Exception:
+            # If Ollama is not reachable, leave the active slot as-is; the
+            # runtime will surface any connectivity errors when used.
+            pass
+
+
+def _ensure_all_providers(providers: dict[str, ProviderSettings]) -> None:
+    """Ensure every built-in has an entry; remove stale custom/local ones."""
+    for pid, defn in PROVIDERS.items():
+        if defn.is_custom or defn.is_local:
+            # Custom and local providers don't need ProviderSettings entries
+            providers.pop(pid, None)
+            continue
+        if pid not in providers:
+            providers[pid] = ProviderSettings(base_url=defn.default_base_url)
+        else:
+            _ensure_base_url(providers[pid], defn)
+        _normalize_special_provider_settings(pid, providers[pid])
+
+
+# -- Load / Save --
+
+
+def load_providers_json(path: Optional[Path] = None) -> ProvidersData:
+    """Load providers.json, creating/repairing as needed."""
+    if path is None:
+        path = get_providers_json_path()
+        _migrate_legacy_providers_json(path)
+    if path.exists() and not path.is_file():
+        raise IsADirectoryError(
+            f"providers.json path exists but is not a regular file: {path}",
+        )
+
+    providers: dict[str, ProviderSettings] = {}
+    custom_providers: dict[str, CustomProviderData] = {}
+    active_llm = ModelSlotConfig()
+    fallback = FallbackConfig()
+
+    if path.is_file():
+        try:
+            with open(path, "r", encoding="utf-8") as fh:
+                raw: dict = json.load(fh)
+            if "providers" in raw and isinstance(raw["providers"], dict):
+                providers, custom_providers, active_llm, fallback = (
+                    _parse_new_format(raw)
+                )
+            else:
+                providers, custom_providers, active_llm, fallback = (
+                    _parse_legacy_format(raw)
+                )
+        except (json.JSONDecodeError, ValueError):
+            providers = {}
+
+    sync_custom_providers(custom_providers)
+    sync_local_models()
+    sync_ollama_models()
+    _ensure_all_providers(providers)
+
+    data = ProvidersData(
+        providers=providers,
+        custom_providers=custom_providers,
+        active_llm=active_llm,
+        fallback=fallback,
+    )
+    _validate_active_llm(data)
+    save_providers_json(data, path)
+    return data
+
+
+def read_providers_json(path: Optional[Path] = None) -> ProvidersData:
+    """Read providers.json without normalizing and writing it back."""
+    if path is None:
+        path = get_providers_json_path()
+        _migrate_legacy_providers_json(path)
+    if path.exists() and not path.is_file():
+        raise IsADirectoryError(
+            f"providers.json path exists but is not a regular file: {path}",
+        )
+    if not path.is_file():
+        return ProvidersData()
+    try:
+        return _load_providers_data_from_path(path)
+    except (json.JSONDecodeError, ValueError):
+        return ProvidersData()
+
+
+def save_providers_json(
+    data: ProvidersData,
+    path: Optional[Path] = None,
+) -> None:
+    if path is None:
+        path = get_providers_json_path()
+        _migrate_legacy_providers_json(path)
+    if path.exists() and not path.is_file():
+        raise IsADirectoryError(
+            f"providers.json path exists but is not a regular file: {path}",
+        )
+    _prepare_secret_parent(path)
+
+    out: dict = {
+        "providers": {
+            pid: settings.model_dump(mode="json")
+            for pid, settings in data.providers.items()
+        },
+        "custom_providers": {
+            pid: cpd.model_dump(mode="json")
+            for pid, cpd in data.custom_providers.items()
+        },
+        "active_llm": data.active_llm.model_dump(mode="json"),
+        "fallback": data.fallback.model_dump(mode="json"),
+    }
+    with open(path, "w", encoding="utf-8") as fh:
+        json.dump(out, fh, indent=2, ensure_ascii=False)
+    _chmod_best_effort(path, 0o600)
+
+
+# -- Mutators --
+
+
+def update_provider_settings(
+    provider_id: str,
+    *,
+    api_key: Optional[str] = None,
+    base_url: Optional[str] = None,
+) -> ProvidersData:
+    """Partially update a provider's settings. Returns updated state."""
+    data = load_providers_json()
+    cpd = data.custom_providers.get(provider_id)
+
+    if cpd is not None:
+        if api_key is not None:
+            cpd.api_key = api_key
+        if base_url is not None:
+            cpd.base_url = base_url
+        if not cpd.base_url:
+            cpd.base_url = cpd.default_base_url
+        register_custom_provider(cpd)
+    else:
+        settings = data.providers.setdefault(provider_id, ProviderSettings())
+        if api_key is not None:
+            settings.api_key = api_key
+        if base_url is not None:
+            settings.base_url = base_url
+        if not settings.base_url:
+            defn = PROVIDERS.get(provider_id)
+            if defn:
+                settings.base_url = defn.default_base_url
+        _normalize_special_provider_settings(provider_id, settings)
+
+    if api_key == "" and data.active_llm.provider_id == provider_id:
+        data.active_llm = ModelSlotConfig()
+
+    save_providers_json(data)
+    return data
+
+
+def set_active_llm(provider_id: str, model: str) -> ProvidersData:
+    data = load_providers_json()
+    data.active_llm = ModelSlotConfig(provider_id=provider_id, model=model)
+    save_providers_json(data)
+    return data
+
+
+# -- Query --
+
+
+def _resolve_slot(
+    slot: ModelSlotConfig,
+    data: ProvidersData,
+) -> Optional[ResolvedModelConfig]:
+    pid = slot.provider_id
+    if not pid or not slot.model:
+        return None
+
+    # Local providers don't need credentials or a providers.json entry
+    defn = PROVIDERS.get(pid)
+    if defn is not None and defn.is_local:
+        return ResolvedModelConfig(
+            model=slot.model,
+            is_local=True,
+            provider_id=pid,
+        )
+
+    if pid not in data.custom_providers and pid not in data.providers:
+        return None
+    base_url, api_key = data.get_credentials(pid)
+    return ResolvedModelConfig(
+        model=slot.model,
+        base_url=base_url,
+        api_key=api_key,
+        provider_id=pid,
+    )
+
+
+def get_active_llm_config() -> Optional[ResolvedModelConfig]:
+    data = load_providers_json()
+    return _resolve_slot(data.active_llm, data)
+
+
+def get_fallback_config() -> FallbackConfig:
+    """Return the current fallback chain configuration."""
+    data = load_providers_json()
+    return data.fallback
+
+
+def set_fallback_config(fallback: FallbackConfig) -> ProvidersData:
+    """Update the fallback chain configuration."""
+    data = load_providers_json()
+    data.fallback = fallback
+    save_providers_json(data)
+    return data
+
+
+def resolve_fallback_chain() -> list[ResolvedModelConfig]:
+    """Resolve the fallback chain to a list of usable model configs.
+
+    Only returns entries whose provider is configured (has credentials).
+    """
+    data = load_providers_json()
+    if not data.fallback.enabled:
+        return []
+    result = []
+    for slot in data.fallback.chain:
+        cfg = _resolve_slot(
+            ModelSlotConfig(provider_id=slot.provider_id, model=slot.model),
+            data,
+        )
+        if cfg is not None:
+            result.append(cfg)
+        else:
+            logger.warning(
+                "Fallback slot %s/%s could not be resolved "
+                "(provider missing or not configured) — skipping",
+                slot.provider_id, slot.model,
+            )
+    return result
+
+
+# -- Utilities --
+
+
+def mask_api_key(api_key: str, visible_chars: int = 4) -> str:
+    if not api_key:
+        return ""
+    if len(api_key) <= visible_chars:
+        return "*" * len(api_key)
+    prefix = api_key[:3] if len(api_key) > 3 else ""
+    suffix = api_key[-visible_chars:]
+    hidden_len = len(api_key) - len(prefix) - visible_chars
+    return f"{prefix}{'*' * max(hidden_len, 4)}{suffix}"
+
+
+def fetch_provider_usage(
+    provider_id: str,
+    *,
+    data: Optional[ProvidersData] = None,
+    urlopen_fn: Callable[..., Any] = _urlopen_no_redirect,
+) -> dict[str, Any]:
+    """Fetch server-side usage details for an OpenAI-compatible provider.
+
+    The browser only receives usage numbers. The full provider key remains in
+    the sandbox secret store and is used by this server-side proxy.
+    """
+    state = data or load_providers_json()
+    base_url, api_key = state.get_credentials(provider_id)
+    if not base_url:
+        raise ValueError(f"Provider '{provider_id}' has no base URL configured.")
+    if not api_key:
+        raise ValueError(f"Provider '{provider_id}' has no API key configured.")
+    if (
+        provider_id == _HOST_AI_PROVIDER_ID
+        or api_key.startswith(_HOST_AI_TOKEN_PREFIX)
+    ) and not _host_ai_base_url_allowed(base_url):
+        raise ValueError(
+            f"Provider '{provider_id}' must use a managed AdClaw AI endpoint.",
+        )
+
+    usage_url = f"{base_url.rstrip('/')}/usage"
+    request = Request(
+        usage_url,
+        headers={
+            "Accept": "application/json",
+            "Authorization": f"Bearer {api_key}",
+            "User-Agent": "AdClaw/host-ai-usage",
+        },
+        method="GET",
+    )
+    try:
+        with urlopen_fn(request, timeout=MODEL_PROVIDER_CHECK_TIMEOUT) as response:
+            status = getattr(response, "status", 200)
+            if status >= 300:
+                raise ProviderUsageRequestError(
+                    f"Provider '{provider_id}' usage request failed with {status}.",
+                )
+            raw = response.read()
+    except (ValueError, ProviderUsageRequestError):
+        raise
+    except HTTPError as exc:
+        raise ProviderUsageRequestError(
+            f"Provider '{provider_id}' usage request failed with {exc.code}.",
+        ) from exc
+    except OSError as exc:
+        raise ProviderUsageRequestError(
+            f"Provider '{provider_id}' usage request failed.",
+        ) from exc
+
+    try:
+        payload = json.loads(raw.decode("utf-8"))
+    except (AttributeError, json.JSONDecodeError) as exc:
+        raise ValueError(
+            f"Provider '{provider_id}' returned invalid usage payload.",
+        ) from exc
+    if not isinstance(payload, dict):
+        raise ValueError(
+            f"Provider '{provider_id}' returned invalid usage payload.",
+        )
+    return payload
+
+
+# -- Custom provider CRUD --
+
+
+def create_custom_provider(
+    provider_id: str,
+    name: str,
+    *,
+    default_base_url: str = "",
+    api_key_prefix: str = "",
+    models: Optional[list[ModelInfo]] = None,
+) -> ProvidersData:
+    err = validate_custom_provider_id(provider_id)
+    if err:
+        raise ValueError(err)
+
+    data = load_providers_json()
+    if provider_id in data.custom_providers:
+        raise ValueError(f"Custom provider '{provider_id}' already exists.")
+
+    cpd = CustomProviderData(
+        id=provider_id,
+        name=name,
+        default_base_url=default_base_url,
+        api_key_prefix=api_key_prefix,
+        models=models or [],
+        base_url=default_base_url,
+    )
+    data.custom_providers[provider_id] = cpd
+    register_custom_provider(cpd)
+    save_providers_json(data)
+    return data
+
+
+def delete_custom_provider(provider_id: str) -> ProvidersData:
+    if is_builtin(provider_id):
+        raise ValueError(f"Cannot delete built-in provider '{provider_id}'.")
+
+    data = load_providers_json()
+    if provider_id not in data.custom_providers:
+        raise ValueError(f"Custom provider '{provider_id}' not found.")
+
+    del data.custom_providers[provider_id]
+    unregister_custom_provider(provider_id)
+
+    if data.active_llm.provider_id == provider_id:
+        data.active_llm = ModelSlotConfig()
+
+    save_providers_json(data)
+    return data
+
+
+def add_model(provider_id: str, model: ModelInfo) -> ProvidersData:
+    data = load_providers_json()
+    defn = PROVIDERS.get(provider_id)
+    if defn is None:
+        raise ValueError(f"Provider '{provider_id}' not found.")
+
+    if is_builtin(provider_id):
+        if provider_id == "ollama":
+            raise ValueError(
+                "Cannot add models to built-in provider 'ollama'. "
+                "Ollama models are managed by the Ollama daemon itself.",
+            )
+        settings = data.providers.setdefault(
+            provider_id,
+            ProviderSettings(base_url=defn.default_base_url),
+        )
+        all_ids = {m.id for m in defn.models} | {
+            m.id for m in settings.extra_models
+        }
+        if model.id in all_ids:
+            raise ValueError(
+                f"Model '{model.id}' already exists in provider "
+                f"'{provider_id}'.",
+            )
+        settings.extra_models.append(model)
+    else:
+        cpd = data.custom_providers.get(provider_id)
+        if cpd is None:
+            raise ValueError(f"Custom provider '{provider_id}' not found.")
+        if any(m.id == model.id for m in cpd.models):
+            raise ValueError(
+                f"Model '{model.id}' already exists in provider "
+                f"'{provider_id}'.",
+            )
+        cpd.models.append(model)
+        register_custom_provider(cpd)
+
+    save_providers_json(data)
+    return data
+
+
+def remove_model(provider_id: str, model_id: str) -> ProvidersData:
+    data = load_providers_json()
+    defn = PROVIDERS.get(provider_id)
+    if defn is None:
+        raise ValueError(f"Provider '{provider_id}' not found.")
+
+    if is_builtin(provider_id):
+        if provider_id == "ollama":
+            raise ValueError(
+                "Cannot remove models from built-in provider 'ollama'. "
+                "Ollama models are managed by the Ollama daemon itself.",
+            )
+        if any(m.id == model_id for m in defn.models):
+            raise ValueError(
+                f"Model '{model_id}' is a built-in model of "
+                f"'{provider_id}' and cannot be removed.",
+            )
+        settings = data.providers.get(provider_id)
+        if settings is None:
+            raise ValueError(
+                f"Model '{model_id}' not found in provider '{provider_id}'.",
+            )
+        original_len = len(settings.extra_models)
+        settings.extra_models = [
+            m for m in settings.extra_models if m.id != model_id
+        ]
+        if len(settings.extra_models) == original_len:
+            raise ValueError(
+                f"Model '{model_id}' not found in provider '{provider_id}'.",
+            )
+    else:
+        cpd = data.custom_providers.get(provider_id)
+        if cpd is None:
+            raise ValueError(f"Custom provider '{provider_id}' not found.")
+        original_len = len(cpd.models)
+        cpd.models = [m for m in cpd.models if m.id != model_id]
+        if len(cpd.models) == original_len:
+            raise ValueError(
+                f"Model '{model_id}' not found in provider '{provider_id}'.",
+            )
+        register_custom_provider(cpd)
+
+    if (
+        data.active_llm.provider_id == provider_id
+        and data.active_llm.model == model_id
+    ):
+        data.active_llm = ModelSlotConfig()
+
+    save_providers_json(data)
+    return data
+
+
+# pylint: disable=too-many-return-statements,too-many-branches
+# pylint: disable=too-many-statements
+async def test_provider_connection(
+    provider_id: str,
+    api_key: Optional[str] = None,
+    base_url: Optional[str] = None,
+) -> dict[str, Any]:
+    """Test if a provider's URL and API key are valid.
+
+    (without testing a specific model).
+
+    This tests network connectivity and authentication at the provider
+    level.
+
+    Args:
+        provider_id: The provider identifier to test
+        api_key: Optional API key to use (overrides saved config)
+        base_url: Optional Base URL to use (overrides saved config)
+
+    Returns:
+        dict with keys:
+        - success: bool - Whether the connection test passed
+        - message: str - Human-readable result message
+
+    Raises:
+        ValueError: If provider is not found
+    """
+    try:
+        import httpx
+    except ImportError:
+        return {
+            "success": False,
+            "message": "httpx library is not installed.",
+        }
+
+    defn = PROVIDERS.get(provider_id)
+    if defn is None:
+        raise ValueError(f"Provider '{provider_id}' not found.")
+
+    data = load_providers_json()
+
+    # Local providers don't need credentials test
+    if defn.is_local:
+        # For local providers, just check if models are available
+        if len(defn.models) > 0:
+            return {
+                "success": True,
+                "message": (
+                    f"{defn.name} is ready with {len(defn.models)} model(s)."
+                ),
+            }
+        else:
+            return {
+                "success": False,
+                "message": f"{defn.name} has no models available.",
+            }
+
+    # Ollama special handling - check daemon connectivity
+    if provider_id == "ollama":
+        try:
+            from .ollama_manager import OllamaModelManager
+
+            models = OllamaModelManager.list_models()
+            return {
+                "success": True,
+                "message": (
+                    f"Ollama daemon is reachable with {len(models)} model(s)."
+                ),
+            }
+        except ImportError:
+            return {
+                "success": False,
+                "message": "Ollama Python SDK is not installed.",
+            }
+        except Exception as e:
+            return {
+                "success": False,
+                "message": f"Ollama daemon is not reachable: {str(e)}",
+            }
+
+    # Remote providers - test API credentials
+    # Use provided credentials or fall back to saved config
+    if not base_url or not api_key:
+        saved_base_url, saved_api_key = data.get_credentials(provider_id)
+        if not base_url:
+            base_url = saved_base_url
+        if not api_key:
+            api_key = saved_api_key
+
+    # If still no credentials (and provider requires them), fail
+    if not api_key and not base_url:
+        # Some providers might work without key if local custom,
+        # but generally we need something
+        if not data.is_configured(defn) and not (api_key or base_url):
+            return {
+                "success": False,
+                "message": f"{defn.name} not configured. Please add API key.",
+            }
+
+    # Get chat model class for this provider
+    chat_model_class_name = get_provider_chat_model(provider_id, data)
+    chat_model_class = get_chat_model_class(chat_model_class_name)
+
+    # Use a lightweight test approach: try to make a simple API call
+    # For OpenAI-compatible APIs, we can use the models list endpoint
+    # This validates URL + Key without needing a specific model ID
+    try:
+        # Most OpenAI-compatible APIs have a /models endpoint
+        # This is a lightweight way to test credentials
+        test_url = f"{base_url.rstrip('/')}/models"
+
+        headers = {}
+        if api_key:
+            headers["Authorization"] = f"Bearer {api_key}"
+
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            response = await client.get(test_url, headers=headers)
+
+            if response.status_code == 401:
+                return {
+                    "success": False,
+                    "message": f"{defn.name} API key is invalid or expired.",
+                }
+            elif response.status_code == 404:
+                # Some providers don't have /models endpoint
+                # try model instantiation
+                pass
+            elif response.status_code >= 500:
+                return {
+                    "success": False,
+                    "message": (
+                        f"{defn.name} server error: {response.status_code}"
+                    ),
+                }
+            elif response.status_code == 200:
+                return {
+                    "success": True,
+                    "message": f"{defn.name} URL and API key are valid.",
+                }
+    except httpx.ConnectError:
+        return {
+            "success": False,
+            "message": (
+                f"Cannot connect to {defn.name}. Please check the Base URL."
+            ),
+        }
+    except httpx.TimeoutException:
+        return {
+            "success": False,
+            "message": f"Connection to {defn.name} timed out.",
+        }
+    except Exception:
+        # If /models endpoint fails,
+        # fall through to model instantiation test
+        pass
+
+    # Fallback: try to instantiate a chat model
+    # (may fail if no valid model exists)
+    # Use the first available model or a common one
+    test_model = None
+    if len(defn.models) > 0:
+        test_model = defn.models[0].id
+    else:
+        # Provider-specific fallback models
+        fallback_models = {
+            "openai": "gpt-3.5-turbo",
+            "dashscope": "qwen-max",
+            "modelscope": "Qwen/Qwen3.5-397B-A17B",
+            "aliyun-codingplan": "qwen3.5-plus",
+        }
+        test_model = fallback_models.get(provider_id, "gpt-3.5-turbo")
+
+    try:
+        # Try to instantiate the model with the configured credentials
+        # Note: This part might still be sync if the SDK init is sync,
+        # but usually init is fast.
+        chat_model_class(
+            model_name=test_model,
+            api_key=api_key,
+            stream=True,
+            client_kwargs={"base_url": base_url} if base_url else {},
+        )
+
+        return {
+            "success": True,
+            "message": f"{defn.name} URL and API key are valid.",
+        }
+    except Exception as e:
+        error_msg = str(e)
+        if "401" in error_msg or "authentication" in error_msg.lower():
+            return {
+                "success": False,
+                "message": f"{defn.name} API key is invalid.",
+            }
+        elif "connection" in error_msg.lower():
+            return {
+                "success": False,
+                "message": (
+                    f"Cannot connect to {defn.name}. "
+                    f"Please check the Base URL."
+                ),
+            }
+        else:
+            return {
+                "success": False,
+                "message": (
+                    f"{defn.name} configuration test failed: {error_msg}"
+                ),
+            }
+
+
+# pylint: disable=too-many-return-statements,too-many-branches
+async def test_model_connection(
+    provider_id: str,
+    model_id: str,
+) -> dict[str, Any]:
+    """Test if a specific model can be used with the configured provider.
+
+    This tests the complete call chain: URL + Key + ModelID.
+
+    Args:
+        provider_id: The provider identifier
+        model_id: The specific model ID to test
+
+    Returns:
+        dict with keys:
+        - success: bool - Whether the model test passed
+        - message: str - Human-readable result message
+
+    Raises:
+        ValueError: If provider is not found
+    """
+    try:
+        import httpx
+    except ImportError:
+        return {
+            "success": False,
+            "message": "httpx library is not installed.",
+        }
+
+    defn = PROVIDERS.get(provider_id)
+    if defn is None:
+        raise ValueError(f"Provider '{provider_id}' not found.")
+
+    data = load_providers_json()
+
+    # Local providers
+    if defn.is_local:
+        # Check if the specific model exists
+        for model in defn.models:
+            if model.id == model_id:
+                return {
+                    "success": True,
+                    "message": f"Model '{model.name}' is available.",
+                }
+        return {
+            "success": False,
+            "message": f"Model '{model_id}' is not available.",
+        }
+
+    # Ollama special handling
+    if provider_id == "ollama":
+        try:
+            from .ollama_manager import OllamaModelManager
+
+            models = OllamaModelManager.list_models()
+            for model in models:
+                if model.name == model_id:
+                    return {
+                        "success": True,
+                        "message": (
+                            f"Model '{model_id}' is available in Ollama."
+                        ),
+                    }
+            return {
+                "success": False,
+                "message": f"Model '{model_id}' is not found in Ollama.",
+            }
+        except Exception as e:
+            return {
+                "success": False,
+                "message": f"Ollama error: {str(e)}",
+            }
+
+    # Remote providers - test the complete call chain
+    if not data.is_configured(defn):
+        return {
+            "success": False,
+            "message": (
+                f"{defn.name} is not configured. Please add API key first."
+            ),
+        }
+
+    base_url, api_key = data.get_credentials(provider_id)
+
+    # For remote providers, use direct API call for more reliable testing
+    # Most OpenAI-compatible APIs use the chat completions endpoint
+    chat_url = f"{base_url.rstrip('/')}/chat/completions"
+
+    headers = {
+        "Content-Type": "application/json",
+    }
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+
+    # Prepare a minimal test request
+    test_payload = {
+        "model": model_id,
+        "messages": [{"role": "user", "content": "hi"}],
+        "max_tokens": 1,
+    }
+
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            response = await client.post(
+                chat_url,
+                json=test_payload,
+                headers=headers,
+            )
+
+            if response.status_code == 401:
+                return {
+                    "success": False,
+                    "message": "API key is invalid or expired.",
+                }
+            elif response.status_code == 404:
+                return {
+                    "success": False,
+                    "message": (
+                        f"Model '{model_id}' does not exist "
+                        f"or is not available."
+                    ),
+                }
+            elif response.status_code == 400:
+                # Check error details for invalid model
+                try:
+                    error_data = response.json()
+                    if "model" in str(error_data).lower():
+                        return {
+                            "success": False,
+                            "message": (
+                                f"Model '{model_id}' is invalid "
+                                f"or not supported."
+                            ),
+                        }
+                    return {
+                        "success": False,
+                        "message": f"Bad request: {error_data}",
+                    }
+                except Exception:
+                    return {
+                        "success": False,
+                        "message": "Bad request (400). Model may be invalid.",
+                    }
+            elif response.status_code >= 500:
+                return {
+                    "success": False,
+                    "message": f"Server error: {response.status_code}",
+                }
+            elif response.status_code == 200:
+                # Successfully called the model!
+                try:
+                    result = response.json()
+                    # Check if there's an error in the response body
+                    if isinstance(result, dict) and "error" in result:
+                        error_info = result["error"]
+                        error_msg = error_info.get("message", str(error_info))
+                        if (
+                            "model" in error_msg.lower()
+                            or "not found" in error_msg.lower()
+                        ):
+                            return {
+                                "success": False,
+                                "message": (
+                                    f"Model '{model_id}' error: {error_msg}"
+                                ),
+                            }
+                        return {
+                            "success": False,
+                            "message": f"API returned error: {error_msg}",
+                        }
+
+                    # Verify we got actual choices/content
+                    if "choices" in result and len(result["choices"]) > 0:
+                        return {
+                            "success": True,
+                            "message": (
+                                f"Model '{model_id}' is working correctly."
+                            ),
+                        }
+                    else:
+                        # Some APIs return 200 but with no choices
+                        # (e.g., processing error)
+                        return {
+                            "success": False,
+                            "message": (
+                                f"Model '{model_id}' returned no content. "
+                                f"It may be unavailable."
+                            ),
+                        }
+                except Exception:
+                    # If we can't parse JSON but got 200,
+                    # consider it a success
+                    return {
+                        "success": True,
+                        "message": (
+                            f"Model '{model_id}' responded "
+                            f"(connection test passed)."
+                        ),
+                    }
+            else:
+                return {
+                    "success": False,
+                    "message": (
+                        f"Unexpected response code: {response.status_code}"
+                    ),
+                }
+
+    except httpx.ConnectError as e:
+        return {
+            "success": False,
+            "message": (
+                f"Cannot connect to {defn.name}. Check the Base URL: {str(e)}"
+            ),
+        }
+    except httpx.TimeoutException:
+        return {
+            "success": False,
+            "message": f"Connection to {defn.name} timed out.",
+        }
+    except Exception as e:
+        error_msg = str(e)
+        return {
+            "success": False,
+            "message": f"Model test failed: {error_msg}",
+        }
